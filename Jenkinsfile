@@ -1,19 +1,23 @@
-
 pipeline {
     agent any
+
+    options {
+        disableConcurrentBuilds()
+    }
 
     parameters {
         choice(
             name: 'VERSION',
-            choices: ['v1', 'v2', 'v-fail'],
+            choices: ['v1', 'v2'],
             description: 'Select application version to deploy'
         )
     }
 
     environment {
         APP_NAME = 'release-app'
-        DEPLOYMENT = 'release-v1'
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        HOME = '/var/lib/jenkins'
+        MINIKUBE_HOME = '/var/lib/jenkins'
     }
 
     stages {
@@ -36,77 +40,80 @@ pipeline {
         stage('Load Image into Minikube') {
             steps {
                 sh '''
-                    if [ "$VERSION" != "v-fail" ]; then
-                        minikube image load ${APP_NAME}:${VERSION}
-                    fi
+                    minikube image load ${APP_NAME}:${VERSION}
                 '''
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy Selected Version') {
             steps {
                 script {
-                    try {
-                        def deployImage = params.VERSION == 'v-fail' ?
-                            "${APP_NAME}:does-not-exist" :
-                            "${APP_NAME}:${VERSION}"
+                    def targetDeployment = params.VERSION == 'v1' ? 'release-v1' : 'release-v2'
+                    def targetService = params.VERSION == 'v1' ? 'release-service' : 'release-v2-service'
 
-                        sh """
-                            kubectl set image deployment/${DEPLOYMENT} \
-                              release-app=${deployImage} \
-                              --kubeconfig=${KUBECONFIG}
+                    withEnv([
+                        "TARGET_DEPLOYMENT=${targetDeployment}",
+                        "TARGET_SERVICE=${targetService}",
+                        "EXPECTED_VERSION=${params.VERSION}"
+                    ]) {
+                        try {
+                            sh '''
+                                kubectl set image deployment/${TARGET_DEPLOYMENT} \
+                                  release-app=${APP_NAME}:${EXPECTED_VERSION} \
+                                  --kubeconfig=${KUBECONFIG}
 
-                            kubectl rollout status deployment/${DEPLOYMENT} \
-                              --timeout=120s \
-                              --kubeconfig=${KUBECONFIG}
-                        """
+                                kubectl rollout status deployment/${TARGET_DEPLOYMENT} \
+                                  --timeout=120s \
+                                  --kubeconfig=${KUBECONFIG}
+                            '''
 
-                        sh '''
-                            kubectl port-forward service/release-service \
-                              8081:5000 \
-                              --kubeconfig=${KUBECONFIG} \
-                              >/tmp/release-port-forward.log 2>&1 &
+                            sh '''
+                                set -eu
+                                PORT=18081
 
-                            echo $! > /tmp/release-port-forward.pid
+                                kubectl port-forward service/${TARGET_SERVICE} \
+                                  ${PORT}:5000 \
+                                  --address=127.0.0.1 \
+                                  --kubeconfig=${KUBECONFIG} \
+                                  >/tmp/release-port-forward.log 2>&1 &
 
-                            for i in $(seq 1 20); do
-                                response=$(curl -fsS http://127.0.0.1:8081/health 2>/dev/null || true)
+                                PF_PID=$!
+                                trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
 
-                                if [ -n "$response" ]; then
-                                    echo "$response"
-                                    echo "$response" | grep -q "\"version\":\"${VERSION}\"" || exit 1
-                                    exit 0
-                                fi
+                                for i in $(seq 1 30); do
+                                    response=$(curl -fsS http://127.0.0.1:${PORT}/health 2>/dev/null || true)
 
-                                sleep 2
-                            done
+                                    if [ -n "$response" ]; then
+                                        echo "$response"
+                                        echo "$response" | grep -q "\\"status\\":\\"healthy\\""
+                                        echo "$response" | grep -q "\\"version\\":\\"${EXPECTED_VERSION}\\""
+                                        exit 0
+                                    fi
 
-                            exit 1
-                        '''
+                                    sleep 2
+                                done
 
-                        echo "Deployment and health check successful."
+                                echo "Health check failed."
+                                cat /tmp/release-port-forward.log || true
+                                exit 1
+                            '''
 
-                    } catch (err) {
-                        echo "Deployment failed. Rolling back..."
+                            echo "Deployment and health check successful."
 
-                        sh '''
-                            kubectl rollout undo deployment/${DEPLOYMENT} \
-                              --kubeconfig=${KUBECONFIG}
+                        } catch (err) {
+                            echo "Deployment failed. Rolling back ${targetDeployment}..."
 
-                            kubectl rollout status deployment/${DEPLOYMENT} \
-                              --timeout=120s \
-                              --kubeconfig=${KUBECONFIG}
-                        '''
+                            sh '''
+                                kubectl rollout undo deployment/${TARGET_DEPLOYMENT} \
+                                  --kubeconfig=${KUBECONFIG}
 
-                        throw err
+                                kubectl rollout status deployment/${TARGET_DEPLOYMENT} \
+                                  --timeout=120s \
+                                  --kubeconfig=${KUBECONFIG}
+                            '''
 
-                    } finally {
-                        sh '''
-                            if [ -f /tmp/release-port-forward.pid ]; then
-                                kill $(cat /tmp/release-port-forward.pid) || true
-                                rm -f /tmp/release-port-forward.pid
-                            fi
-                        '''
+                            throw err
+                        }
                     }
                 }
             }
