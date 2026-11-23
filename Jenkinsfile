@@ -1,10 +1,11 @@
+
 pipeline {
     agent any
 
     parameters {
         choice(
             name: 'VERSION',
-            choices: ['v1', 'v2'],
+            choices: ['v1', 'v2', 'v-fail'],
             description: 'Select application version to deploy'
         )
     }
@@ -35,7 +36,9 @@ pipeline {
         stage('Load Image into Minikube') {
             steps {
                 sh '''
-                    minikube image load ${APP_NAME}:${VERSION}
+                    if [ "$VERSION" != "v-fail" ]; then
+                        minikube image load ${APP_NAME}:${VERSION}
+                    fi
                 '''
             }
         }
@@ -44,27 +47,37 @@ pipeline {
             steps {
                 script {
                     try {
-                        sh '''
+                        def deployImage = params.VERSION == 'v-fail' ?
+                            "${APP_NAME}:does-not-exist" :
+                            "${APP_NAME}:${VERSION}"
+
+                        sh """
                             kubectl set image deployment/${DEPLOYMENT} \
-                              release-app=${APP_NAME}:${VERSION} \
+                              release-app=${deployImage} \
                               --kubeconfig=${KUBECONFIG}
 
                             kubectl rollout status deployment/${DEPLOYMENT} \
                               --timeout=120s \
                               --kubeconfig=${KUBECONFIG}
-                        '''
+                        """
 
                         sh '''
                             kubectl port-forward service/release-service \
                               8081:5000 \
                               --kubeconfig=${KUBECONFIG} \
                               >/tmp/release-port-forward.log 2>&1 &
+
                             echo $! > /tmp/release-port-forward.pid
 
                             for i in $(seq 1 20); do
-                                if curl -fsS http://127.0.0.1:8081/health; then
+                                response=$(curl -fsS http://127.0.0.1:8081/health 2>/dev/null || true)
+
+                                if [ -n "$response" ]; then
+                                    echo "$response"
+                                    echo "$response" | grep -q "\"version\":\"${VERSION}\"" || exit 1
                                     exit 0
                                 fi
+
                                 sleep 2
                             done
 
@@ -72,6 +85,7 @@ pipeline {
                         '''
 
                         echo "Deployment and health check successful."
+
                     } catch (err) {
                         echo "Deployment failed. Rolling back..."
 
@@ -85,6 +99,7 @@ pipeline {
                         '''
 
                         throw err
+
                     } finally {
                         sh '''
                             if [ -f /tmp/release-port-forward.pid ]; then
@@ -102,8 +117,9 @@ pipeline {
         success {
             echo "Release ${VERSION} deployed successfully."
         }
+
         failure {
-            echo "Release failed. Check the deployment and rollback logs."
+            echo "Release failed. Check deployment and rollback logs."
         }
     }
 }
